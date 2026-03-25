@@ -1,0 +1,7 @@
+__pycache__/
+.vscode/
+.DS_Store
+data.db
+post.bin
+post.lua
+output
