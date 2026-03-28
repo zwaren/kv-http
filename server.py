@@ -7,6 +7,12 @@ import uuid
 from db_lock_wrapper import AsyncStorage
 
 
+STATUS_DESCS = {
+    200: 'OK',
+    404: 'Not Found',
+    500: 'Internal Server Error',
+}
+
 Request = Tuple[str, str, Dict[str, str], bytes]
 
 
@@ -33,22 +39,42 @@ class HTTPServer:
 
     # ---------- CORE ----------
 
+    async def handle_ping(self, reader: StreamReader, writer: StreamWriter):
+        try:
+            while True:
+                req = await reader.readuntil(b"\r\n\r\n")
+                if req is None:
+                    break
+
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Length: 2\r\n"
+                    b"Connection: keep-alive\r\n"
+                    b"\r\n"
+                    b"OK"
+                )
+                await writer.drain()
+
+        except asyncio.IncompleteReadError:
+            pass
+        finally:
+            writer.close()
+            await writer.wait_closed()
+    
     async def handle_client(
         self,
         reader: StreamReader,
         writer: StreamWriter
     ) -> None:
         try:
-            request = await self._read_request(reader)
-            if request is None:
-                return
+            while True:
+                request = await self._read_request(reader)
+                if request is None:
+                    return
+                method, path, headers, body = request
+                response = await self._route(method, path, body, writer)
+                await writer.drain()
 
-            method, path, headers, body = request
-
-            response = await self._route(method, path, body)
-            writer.write(response)
-
-            await writer.drain()
         except Exception as e:
             writer.write(self._response(500, str(e).encode()))
         finally:
@@ -61,48 +87,67 @@ class HTTPServer:
         self,
         method: str,
         path: str,
-        body: bytes
-    ) -> bytes:
+        body: bytes,
+        writer: StreamWriter,
+    ):
         parsed = urlparse(path)
         parts: List[str] = parsed.path.strip("/").split("/")
 
         if method == "POST" and parts == ["records"]:
-            return await self._handle_post(body)
+            await self._handle_post(body, writer)
+            return
 
         if method == "GET" and parts[0] == "dump":
-            return await self._handle_dump()
+            await self._handle_dump(writer)
+            return
 
         if method == "GET" and parts[0] == "records":
             if len(parts) == 2:
-                return await self._handle_get(parts[1])
+                await self._handle_get(parts[1], writer)
+                return
             elif len(parts) == 1:
-                return await self._handle_get_all()
+                await self._handle_get_all(writer)
+                return
 
-        return self._response(404, b"not found")
+        writer.write(self._response(404, b"not found"))
 
     # ---------- HANDLERS ----------
 
-    async def _handle_post(self, body: bytes) -> bytes:
+    async def _handle_post(self, body: bytes, writer: StreamWriter):
         await self.storage.put(body[:16], body[16:])
-        return self._response(200, b"OK")
+        writer.write(self._response(200, b"OK"))
 
-    async def _handle_get(self, key_str: str) -> bytes:
+    async def _handle_get(self, key_str: str, writer: StreamWriter):
         key: bytes = uuid.UUID(key_str).bytes
 
         value: Optional[bytes] = await self.storage.get(key)
         if value is None:
-            return self._response(404, b"not found")
+            writer.write(self._response(404, b"not found"))
+            return
 
-        return self._response(200, value)
+        writer.write(self._response(200, value))
 
-    async def _handle_get_all(self) -> bytes:
+    async def _handle_get_all(self, writer: StreamWriter):
         items: List[Tuple[bytes, bytes]] = await self.storage.items()
         res = [item[0] + item[1] for item in items]
-        return self._response(200, b'\n'.join(res))
+        writer.write(self._response(200, b'\n'.join(res)))
     
-    async def _handle_dump(self) -> bytes:
-        data = self.storage.storage.m[:self.storage.storage.write_offset]
-        return self._response(200, data, "application/octet-stream")
+    async def _handle_dump(self, writer: StreamWriter):
+        size = self.storage.storage.write_offset
+
+        writer.write(
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: application/octet-stream\r\n"
+            b"Content-Length: " + str(size).encode() + b"\r\n"
+            b"Connection: keep-alive\r\n"
+            b"\r\n"
+        )
+
+        CHUNK = 1 * 1024 * 1024
+        view = memoryview(self.storage.storage.m)
+        for i in range(0, size, CHUNK):
+            await writer.drain()
+            writer.write(view[i:min(i+CHUNK, size)])
 
     # ---------- HTTP PARSING ----------
 
@@ -147,12 +192,13 @@ class HTTPServer:
             self,
             status: int,
             body: bytes,
-            content_type="application/octet-stream"
+            content_type="application/octet-stream",
+            connection="keep-alive"
             ) -> bytes:
         return (
-            f"HTTP/1.1 {status} OK\r\n"
+            f"HTTP/1.1 {status} {STATUS_DESCS[status]}\r\n"
             f"Content-Type: {content_type}\r\n"
             f"Content-Length: {len(body)}\r\n"
-            "Connection: close\r\n"
+            f"Connection: {connection}\r\n"
             "\r\n"
         ).encode() + body

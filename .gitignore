@@ -2,6 +2,7 @@ __pycache__/
 .vscode/
 .DS_Store
 data.db
-post.bin
-post.lua
 output
+out.prof
+out.svg
+bench.py
